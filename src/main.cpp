@@ -1,0 +1,831 @@
+#include <Adafruit_NeoPixel.h>
+#include <Arduino.h>
+#include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+
+// --- BLE Dependencies ---
+#include <NimBLEDevice.h>
+#include <NimBLEHIDDevice.h>
+#include <NimBLEServer.h>
+#include <NimBLEUtils.h>
+#if defined(CONFIG_NIMBLE_CPP_IDF)
+#include "host/ble_hs_id.h"
+#else
+#include "nimble/nimble/host/include/host/ble_hs_id.h"
+#endif
+
+// --- USB Host Dependencies ---
+#include "hid_host.h"
+#include "usb/usb_host.h"
+
+// ================= CONFIGURATION =================
+#define NUM_SLOTS 4
+#define LED_PIN 48
+#define LED_BRIGHTNESS 48
+
+// POWER SAVING
+#define IDLE_TIME_ECO_MS 10000
+#define IDLE_TIME_SLEEP_MS 1800000
+
+// Button controls
+#define BOOT_BUTTON_PIN 0
+#define BOOT_SHORT_PRESS_MS 60
+#define BOOT_LONG_PRESS_MS 1500
+
+// Key Codes
+#define KEY_MOD_LSHIFT 0x02
+#define KEY_MOD_RSHIFT 0x20
+#define KEY_INSERT 0x49
+#define KEY_1 0x1E
+#define KEY_2 0x1F
+#define KEY_3 0x20
+#define KEY_4 0x21
+#define KEY_0 0x27
+
+// ================= GLOBALS =================
+// ---> FIX: Changed to NEO_GRBW to support your SK6812 4-Channel LED
+Adafruit_NeoPixel pixels(1, LED_PIN, NEO_GRBW + NEO_KHZ800);
+static uint8_t wasdKeysLightState = 0;
+static uint8_t otherKeysLightState = 0;
+static uint8_t gameKeysState = 0;
+
+enum ConnectionState
+{
+  STATE_DISCONNECTED_RECONNECTING,
+  STATE_DISCONNECTED_PAIRING,
+  STATE_CONNECTED
+};
+
+RTC_DATA_ATTR int storedSlot = 0;
+
+volatile ConnectionState appState = STATE_DISCONNECTED_RECONNECTING;
+volatile int currentSlot = 0;
+volatile bool isSwitching = false;
+volatile bool isConnected = false;
+
+unsigned long lastKeyTime = 0;
+bool isEcoMode = false;
+
+// Your Custom Catppuccin Hex Colors
+uint32_t slotColors[4] = {0x04A5E5, 0xFE640B, 0xD20F39, 0x40A02B};
+uint8_t baseMac[6];
+constexpr uint16_t INVALID_CONN_HANDLE = 0xFFFF;
+
+NimBLEServer *pServer = nullptr;
+NimBLEHIDDevice *pHidDev = nullptr;
+NimBLECharacteristic *pInputChar = nullptr;
+NimBLECharacteristic *pConsumerChar = nullptr;
+QueueHandle_t hidQueue = nullptr;
+volatile uint16_t activeConnHandle = INVALID_CONN_HANDLE;
+
+typedef struct
+{
+  uint8_t *rawData;
+  size_t len;
+} hid_event_t;
+
+// --- 1-TO-1 UNIVERSAL HID DESCRIPTOR ---
+const uint8_t hidReportMap[] = {
+    // 1. Standard Keyboard (ID 1)
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xE0,
+    0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x08, 0x81, 0x03, 0x95, 0x05, 0x75, 0x01, 0x05, 0x08,
+    0x19, 0x01, 0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x03,
+    0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00,
+    0x29, 0x65, 0x81, 0x00, 0xC0,
+
+    // 2. Consumer Control / Media (ID 2)
+    0x05, 0x0C,       // Usage Page (Consumer)
+    0x09, 0x01,       // Usage (Consumer Control)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, 0x02,       //   Report ID (2)
+    0x19, 0x00,       //   Usage Minimum (0)
+    0x2A, 0xFF, 0x03, //   Usage Maximum (1023)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x26, 0xFF, 0x03, //   Logical Maximum (1023)
+    0x95, 0x01,       //   Report Count (1)
+    0x75, 0x10,       //   Report Size (16 bits)
+    0x81, 0x00,       //   Input (Data, Array, Absolute)
+    0xC0              // End Collection
+};
+
+// ================= FORWARD DECLARATIONS =================
+void startBLE(int slot);
+void stopBLE();
+void updateLED();
+void processHID(hid_event_t *evt);
+void handleSlotSwitch(int newSlot, bool pairingMode);
+void handleFactoryReset();
+void checkPowerManagement();
+void handleBootButton();
+void clearBondsAndEnterPairing();
+void buildSlotBleAddress(int slot, uint8_t out[6]);
+bool configureSlotBleIdentity(int slot);
+
+// ================= CALLBACKS =================
+class MySecurityCallbacks : public NimBLESecurityCallbacks
+{
+  bool onConfirmPIN(uint32_t pin) override { return true; }
+  bool onSecurityRequest() override { return true; }
+  void onAuthenticationComplete(ble_gap_conn_desc *desc) override
+  {
+    if (!desc->sec_state.encrypted)
+    {
+      pServer->disconnect(desc->conn_handle);
+    }
+  }
+  uint32_t onPassKeyRequest() override { return 123456; }
+  void onPassKeyNotify(uint32_t pass_key) override {}
+};
+
+class MyServerCallbacks : public NimBLEServerCallbacks
+{
+  void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) override
+  {
+    activeConnHandle = desc->conn_handle;
+    isConnected = true;
+    appState = STATE_CONNECTED;
+    updateLED();
+    lastKeyTime = millis();
+    isEcoMode = false;
+  }
+
+  void onDisconnect(NimBLEServer *pServer) override
+  {
+    activeConnHandle = INVALID_CONN_HANDLE;
+    isConnected = false;
+    if (isSwitching)
+      return;
+    if (appState == STATE_CONNECTED)
+      appState = STATE_DISCONNECTED_RECONNECTING;
+    pServer->getAdvertising()->start();
+    updateLED();
+  }
+};
+
+// ================= USB CALLBACKS =================
+void hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
+                                 const hid_host_interface_event_t event,
+                                 void *arg)
+{
+  if (event == HID_HOST_INTERFACE_EVENT_INPUT_REPORT)
+  {
+    const size_t buffer_size = 64;
+    uint8_t *data_buffer = (uint8_t *)malloc(buffer_size);
+    size_t data_len = 0;
+
+    if (data_buffer)
+    {
+      esp_err_t err = hid_host_device_get_raw_input_report_data(
+          hid_device_handle, data_buffer, buffer_size, &data_len);
+
+      if (err == ESP_OK && data_len > 0)
+      {
+        hid_event_t evt;
+        evt.len = data_len;
+        evt.rawData = data_buffer;
+
+        if (hidQueue != NULL)
+        {
+          if (xQueueSend(hidQueue, &evt, 0) != pdTRUE)
+          {
+            free(data_buffer);
+          }
+        }
+        else
+        {
+          free(data_buffer);
+        }
+      }
+      else
+      {
+        free(data_buffer);
+      }
+    }
+  }
+  else if (event == HID_HOST_INTERFACE_EVENT_DISCONNECTED)
+  {
+    hid_host_device_close(hid_device_handle);
+  }
+}
+
+void hid_host_driver_callback(hid_host_device_handle_t hid_device_handle,
+                              const hid_host_driver_event_t event, void *arg)
+{
+  if (event == HID_HOST_DRIVER_EVENT_CONNECTED)
+  {
+    const hid_host_device_config_t dev_config = {
+        .callback = hid_host_interface_callback, .callback_arg = NULL};
+    hid_host_device_open(hid_device_handle, &dev_config);
+    hid_host_device_start(hid_device_handle);
+  }
+}
+
+// ================= LOGIC =================
+
+void buildSlotBleAddress(int slot, uint8_t out[6])
+{
+  memcpy(out, baseMac, sizeof(baseMac));
+
+  // Use a stable static-random address per slot instead of rewriting the ESP
+  // base MAC at runtime, which destabilizes bonding and reconnects.
+  out[0] = (out[0] & 0xF0) | ((slot + 1) * 3);
+  out[5] = (out[5] & 0x3F) | 0xC0;
+}
+
+bool configureSlotBleIdentity(int slot)
+{
+  uint8_t slotAddress[6];
+  buildSlotBleAddress(slot, slotAddress);
+  NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+
+  int rc = ble_hs_id_set_rnd(slotAddress);
+  if (rc != 0)
+  {
+    Serial.printf("Failed to set BLE address for slot %d, rc=%d\n", slot + 1,
+                  rc);
+    NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_PUBLIC);
+    return false;
+  }
+
+  return true;
+}
+
+void updateLED()
+{
+  if (appState == STATE_CONNECTED)
+  {
+    if (isEcoMode)
+    {
+      // Eco Mode: Dim Rosewater (RGB: 24, 22, 22). White channel explicitly 0.
+      pixels.setPixelColor(0, pixels.Color(129, 200, 190, 20));
+    }
+    else
+    {
+      // Decodes Hex & Forces the blinding White LED to remain OFF
+      uint32_t hex = slotColors[currentSlot];
+      uint8_t r = (hex >> 16) & 0xFF;
+      uint8_t g = (hex >> 8) & 0xFF;
+      uint8_t b_val = hex & 0xFF;
+      pixels.setPixelColor(0, pixels.Color(r, g, b_val, 0));
+    }
+  }
+  else
+  {
+    pixels.setPixelColor(0, 0);
+  }
+  pixels.show();
+}
+
+void startBLE(int slot)
+{
+  isSwitching = false;
+  currentSlot = slot;
+  storedSlot = slot;
+  activeConnHandle = INVALID_CONN_HANDLE;
+
+  char name[20];
+  snprintf(name, sizeof(name), "G710-Slot-%d", slot + 1);
+
+  NimBLEDevice::init(name);
+  configureSlotBleIdentity(slot);
+
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEDevice::setSecurityAuth(true, false, true);
+  NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC |
+                                   BLE_SM_PAIR_KEY_DIST_ID);
+  NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC |
+                                   BLE_SM_PAIR_KEY_DIST_ID);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  NimBLEDevice::setSecurityCallbacks(new MySecurityCallbacks());
+
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  pHidDev = new NimBLEHIDDevice(pServer);
+  pHidDev->reportMap((uint8_t *)hidReportMap, sizeof(hidReportMap));
+
+  pInputChar = pHidDev->inputReport(1);
+  pConsumerChar = pHidDev->inputReport(2);
+
+  pHidDev->manufacturer()->setValue("ESP-Custom");
+  pHidDev->pnp(0x02, 0xe502, 0xa111, 0x0211);
+  pHidDev->hidInfo(0x00, 0x01);
+
+  NimBLEAdvertising *pAdvertising = pServer->getAdvertising();
+  pAdvertising->setAppearance(HID_KEYBOARD);
+  pAdvertising->setName(name);
+  pAdvertising->addServiceUUID(pHidDev->hidService()->getUUID());
+  pAdvertising->setScanResponse(true);
+
+  pAdvertising->setMinInterval(32);
+  pAdvertising->setMaxInterval(48);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMaxPreferred(0x0C);
+
+  pHidDev->startServices();
+  pAdvertising->start();
+  lastKeyTime = millis();
+}
+
+void stopBLE()
+{
+  isSwitching = true;
+  if (pServer)
+  {
+    std::vector<uint16_t> peers = pServer->getPeerDevices();
+    for (uint16_t connHandle : peers)
+    {
+      pServer->disconnect(connHandle);
+    }
+
+    if (activeConnHandle != INVALID_CONN_HANDLE && peers.empty())
+    {
+      pServer->disconnect(activeConnHandle);
+    }
+
+    if (pServer->getConnectedCount() > 0)
+    {
+      unsigned long start = millis();
+      while (pServer->getConnectedCount() > 0 && millis() - start < 1000)
+        delay(10);
+    }
+    if (pServer->getAdvertising()->isAdvertising())
+      pServer->getAdvertising()->stop();
+    NimBLEDevice::deinit(true);
+    pServer = nullptr;
+    pHidDev = nullptr;
+    pInputChar = nullptr;
+    pConsumerChar = nullptr;
+    activeConnHandle = INVALID_CONN_HANDLE;
+    isConnected = false;
+  }
+}
+
+void handleSlotSwitch(int newSlot, bool pairingMode)
+{
+  if (newSlot == currentSlot &&
+      pairingMode == (appState == STATE_DISCONNECTED_PAIRING))
+    return;
+  stopBLE();
+  delay(600);
+  currentSlot = newSlot;
+  appState = pairingMode ? STATE_DISCONNECTED_PAIRING
+                         : STATE_DISCONNECTED_RECONNECTING;
+  startBLE(currentSlot);
+}
+
+void handleFactoryReset()
+{
+  stopBLE();
+  for (int i = 0; i < 5; i++)
+  {
+    // Red visual reset indicator
+    pixels.setPixelColor(0, pixels.Color(255, 0, 0, 0));
+    pixels.show();
+    delay(100);
+    pixels.setPixelColor(0, 0);
+    pixels.show();
+    delay(100);
+  }
+  NimBLEDevice::init("");
+  NimBLEDevice::deleteAllBonds();
+  ESP.restart();
+}
+
+void clearBondsAndEnterPairing()
+{
+  stopBLE();
+  NimBLEDevice::init("");
+  NimBLEDevice::deleteAllBonds();
+  NimBLEDevice::deinit(true);
+  delay(200);
+  appState = STATE_DISCONNECTED_PAIRING;
+  startBLE(currentSlot);
+}
+
+void enterDeepSleep()
+{
+  stopBLE();
+  pixels.clear();
+  pixels.show();
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+  esp_deep_sleep_start();
+}
+
+bool ignoreWasdKeysLights(hid_event_t *evt)
+{
+  // HID for WASD lights:
+  // HID len=4: 03 00 00 01
+  // HID len=8: 04 00 02 04 00 00 00 00
+  // HID len=4: 03 00 00 00
+
+  if (evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x01)
+  {
+    wasdKeysLightState = 1; // 1. rapor geldi
+    free(evt->rawData);
+    return true;
+  }
+
+  if (wasdKeysLightState == 1 && evt->len == 8 && evt->rawData[0] == 0x04)
+  {
+    wasdKeysLightState = 2; // 2. rapor geldi
+    free(evt->rawData);
+    return true;
+  }
+
+  if (wasdKeysLightState == 2 && evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x00)
+  {
+    wasdKeysLightState = 0; // 3. rapor geldi, sekans tamamlandı
+    free(evt->rawData);
+    return true;
+  }
+  return false;
+}
+
+bool ignoreOtherKeysLights(hid_event_t *evt)
+{
+  // HID for the REST of the leyboard lights:
+  // HID len=4: 03 00 00 02
+  // HID len=8: 04 00 01 04 00 00 00 00
+  // HID len=4: 03 00 00 00
+
+  if (evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x02)
+  {
+    otherKeysLightState = 1; // 1. rapor geldi
+    free(evt->rawData);
+    return true;
+  }
+
+  if (otherKeysLightState == 1 && evt->len == 8 && evt->rawData[0] == 0x04)
+  {
+    otherKeysLightState = 2; // 2. rapor geldi
+    free(evt->rawData);
+    return true;
+  }
+
+  if (otherKeysLightState == 2 && evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x00)
+  {
+    otherKeysLightState = 0; // 3. rapor geldi, sekans tamamlandı
+    free(evt->rawData);
+    return true;
+  }
+  return false;
+}
+
+bool ignoreGameButton(hid_event_t *evt)
+{
+  // HID for game button:
+  // HID len=4: 03 00 00 04
+  // HID len=8: 04 00 04 04 00 00 00 00
+  // HID len=4: 03 00 00 00
+
+  if (evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x04)
+  {
+    gameKeysState = 1; // 1. rapor geldi
+    free(evt->rawData);
+    return true;
+  }
+
+  if (gameKeysState == 1 && evt->len == 8 && evt->rawData[0] == 0x04)
+  {
+    gameKeysState = 2; // 2. rapor geldi
+    free(evt->rawData);
+    return true;
+  }
+
+  if (gameKeysState == 2 && evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x00)
+  {
+    gameKeysState = 0; // 3. rapor geldi, sekans tamamlandı
+    free(evt->rawData);
+    return true;
+  }
+  return false;
+}
+
+void processHID(hid_event_t *evt)
+{
+
+  // DEBUG - HID kodlarini serial.monitor'e yazdir
+  // Serial.printf("HID len=%d: ", evt->len);
+  // for (size_t i = 0; i < evt->len; i++)
+  // {
+  //   Serial.printf("%02X ", evt->rawData[i]);
+  // }
+  // Serial.println();
+
+  lastKeyTime = millis();
+  if (isEcoMode && isConnected)
+  {
+    isEcoMode = false;
+    updateLED();
+  }
+
+  // --- STANDARD KEYBOARD (len=8, Report ID yok) ---
+
+  // Ignore the backlight keys and game key (they were trigering 'alt' key)
+  if (ignoreWasdKeysLights(evt))
+    return;
+  if (ignoreOtherKeysLights(evt))
+    return;
+  if (ignoreGameButton(evt))
+    return;
+
+  if (evt->len == 8)
+  {
+    uint8_t mod = evt->rawData[0];
+    bool isShift = (mod & KEY_MOD_LSHIFT) || (mod & KEY_MOD_RSHIFT);
+    bool isInsert = false;
+    int numKey = -1;
+
+    for (int i = 2; i < 8; i++)
+    {
+      if (evt->rawData[i] == KEY_INSERT)
+        isInsert = true;
+      if (evt->rawData[i] == KEY_1)
+        numKey = 0;
+      if (evt->rawData[i] == KEY_2)
+        numKey = 1;
+      if (evt->rawData[i] == KEY_3)
+        numKey = 2;
+      if (evt->rawData[i] == KEY_4)
+        numKey = 3;
+      if (evt->rawData[i] == KEY_0)
+        numKey = 99;
+    }
+
+    if (isInsert && numKey != -1)
+    {
+      if (isShift && numKey == 99)
+      {
+        free(evt->rawData);
+        handleFactoryReset();
+        return;
+      }
+      if (isShift && numKey <= 3)
+        handleSlotSwitch(numKey, true);
+      else if (numKey <= 3)
+        handleSlotSwitch(numKey, false);
+      free(evt->rawData);
+      return;
+    }
+
+    if (appState == STATE_CONNECTED && pInputChar)
+    {
+      pInputChar->setValue(evt->rawData, 8);
+      pInputChar->notify();
+    }
+  }
+
+  // --- MEDIA TUSLARI (len=2, rawData[0]==0x02) ---
+  else if (evt->len == 2 && evt->rawData[0] == 0x02)
+  {
+    if (appState == STATE_CONNECTED && pConsumerChar)
+    {
+      uint8_t g710val = evt->rawData[1];
+      uint16_t hidUsage = 0;
+
+      // G710 değerlerini standart HID Consumer Control usage ID'ye map et
+      if (g710val == 0x01)
+        hidUsage = 0x00B5; // Sonraki
+      else if (g710val == 0x02)
+        hidUsage = 0x00B6; // Önceki
+      else if (g710val == 0x04)
+        hidUsage = 0x00B7; // Stop
+      else if (g710val == 0x08)
+        hidUsage = 0x00CD; // Play/Pause
+      else if (g710val == 0x10)
+        hidUsage = 0x00E9; // Ses Artır
+      else if (g710val == 0x20)
+        hidUsage = 0x00EA; // Ses Azalt
+      else if (g710val == 0x40)
+        hidUsage = 0x00E2; // Sessiz
+
+      if (hidUsage != 0)
+      {
+        uint8_t mediaReport[2];
+        mediaReport[0] = hidUsage & 0xFF;
+        mediaReport[1] = (hidUsage >> 8) & 0xFF;
+        pConsumerChar->setValue(mediaReport, 2);
+        pConsumerChar->notify();
+        delay(10);
+        // Tuş bırakma
+        mediaReport[0] = 0x00;
+        mediaReport[1] = 0x00;
+        pConsumerChar->setValue(mediaReport, 2);
+        pConsumerChar->notify();
+      }
+    }
+  }
+
+  // --- G TUSLARI (len=4, rawData[0]==0x03) ---
+  else if (evt->len == 4 && evt->rawData[0] == 0x03)
+  {
+    if (appState == STATE_CONNECTED && pInputChar)
+    {
+      uint8_t gReport[8] = {0};
+      uint8_t gByte = evt->rawData[1];
+      uint8_t mByte = evt->rawData[2];
+
+      // G1-G6 → F13-F18
+      if (gByte == 0x01)
+        gReport[2] = 0x68; // F13
+      else if (gByte == 0x02)
+        gReport[2] = 0x69; // F14
+      else if (gByte == 0x04)
+        gReport[2] = 0x6A; // F15
+      else if (gByte == 0x08)
+        gReport[2] = 0x6B; // F16
+      else if (gByte == 0x10)
+        gReport[2] = 0x6C; // F17
+      else if (gByte == 0x20)
+        gReport[2] = 0x6D; // F18
+
+      // M1-M3, MR → F19-F22
+      if (mByte == 0x10)
+        gReport[2] = 0x6E; // F19
+      else if (mByte == 0x20)
+        gReport[2] = 0x6F; // F20
+      else if (mByte == 0x40)
+        gReport[2] = 0x70; // F21
+      else if (mByte == 0x80)
+        gReport[2] = 0x71; // F22
+
+      if (gReport[2] != 0)
+      {
+        pInputChar->setValue(gReport, 8);
+        pInputChar->notify();
+        delay(10);
+        memset(gReport, 0, 8);
+        pInputChar->setValue(gReport, 8);
+        pInputChar->notify();
+      }
+    }
+  }
+
+  free(evt->rawData);
+}
+
+void checkPowerManagement()
+{
+  unsigned long now = millis();
+  if (now - lastKeyTime > IDLE_TIME_SLEEP_MS)
+    enterDeepSleep();
+
+  if (isConnected && !isEcoMode && (now - lastKeyTime > IDLE_TIME_ECO_MS))
+  {
+    // Disabled updateConnParams to fix Error 2 spam
+    isEcoMode = true;
+    updateLED();
+  }
+}
+
+void handleBootButton()
+{
+  static bool prevPressed = false;
+  static unsigned long pressedAt = 0;
+  static bool initialized = false;
+  static unsigned long readyAt = 0;
+
+  bool pressed = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+
+  if (!initialized)
+  {
+    initialized = true;
+    readyAt = millis() + 1200;
+    prevPressed = pressed;
+    return;
+  }
+
+  if (millis() < readyAt)
+  {
+    prevPressed = pressed;
+    return;
+  }
+
+  if (pressed && !prevPressed)
+  {
+    pressedAt = millis();
+  }
+
+  if (!pressed && prevPressed)
+  {
+    unsigned long heldMs = millis() - pressedAt;
+    if (heldMs >= BOOT_LONG_PRESS_MS)
+    {
+      clearBondsAndEnterPairing();
+    }
+    else if (heldMs >= BOOT_SHORT_PRESS_MS)
+    {
+      int nextSlot = (currentSlot + 1) % NUM_SLOTS;
+      handleSlotSwitch(nextSlot, false);
+    }
+  }
+
+  prevPressed = pressed;
+}
+
+// ================= TASKS =================
+void usb_lib_task(void *arg)
+{
+  while (1)
+    usb_host_lib_handle_events(portMAX_DELAY, NULL);
+}
+void hid_host_task(void *arg)
+{
+  const usb_host_config_t host_config = {.skip_phy_setup = false,
+                                         .intr_flags = ESP_INTR_FLAG_LEVEL1};
+  usb_host_install(&host_config);
+  xTaskCreate(usb_lib_task, "usb_events", 4096, NULL, 2, NULL);
+  const hid_host_driver_config_t hid_config = {.create_background_task = true,
+                                               .task_priority = 5,
+                                               .stack_size = 4096,
+                                               .core_id = 0,
+                                               .callback =
+                                                   hid_host_driver_callback,
+                                               .callback_arg = NULL};
+  hid_host_install(&hid_config);
+  vTaskDelete(NULL);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  pixels.begin();
+  pixels.setBrightness(LED_BRIGHTNESS);
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
+  {
+    currentSlot = storedSlot;
+  }
+
+  esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
+
+  // VBUS enable - USB task başlamadan önce
+  pinMode(12, OUTPUT);
+  digitalWrite(12, HIGH);
+
+  hidQueue = xQueueCreate(20, sizeof(hid_event_t));
+  xTaskCreate(hid_host_task, "hid_task", 4096, NULL, 2, NULL);
+  startBLE(currentSlot);
+}
+
+void loop()
+{
+  hid_event_t evt;
+  int drainCount = 0;
+
+  while (hidQueue != NULL && xQueueReceive(hidQueue, &evt, 0) &&
+         drainCount < 10)
+  {
+    processHID(&evt);
+    drainCount++;
+  }
+
+  handleBootButton();
+  checkPowerManagement();
+
+  static unsigned long lastUpdate = 0;
+  unsigned long now = millis();
+
+  if (appState == STATE_CONNECTED)
+  {
+    if (now - lastUpdate > 1000)
+      lastUpdate = now;
+  }
+  else if (appState == STATE_DISCONNECTED_PAIRING)
+  {
+    int b = (now % 2000) > 1000 ? 2000 - (now % 2000) : (now % 2000);
+    b = map(b, 0, 1000, 0, 255);
+
+    uint32_t hex = slotColors[currentSlot];
+    uint8_t r = ((hex >> 16) & 0xFF) * b / 255;
+    uint8_t g = ((hex >> 8) & 0xFF) * b / 255;
+    uint8_t b_val = (hex & 0xFF) * b / 255;
+
+    pixels.setPixelColor(0, pixels.Color(r, g, b_val, 0));
+    pixels.show();
+  }
+  else if (appState == STATE_DISCONNECTED_RECONNECTING)
+  {
+    long cycle = now % 2000;
+    bool on = (cycle < 100) || (cycle > 200 && cycle < 300) ||
+              (cycle > 400 && cycle < 500);
+    if (on)
+    {
+      uint32_t hex = slotColors[currentSlot];
+      uint8_t r = (hex >> 16) & 0xFF;
+      uint8_t g = (hex >> 8) & 0xFF;
+      uint8_t b_val = hex & 0xFF;
+      pixels.setPixelColor(0, pixels.Color(r, g, b_val, 0));
+    }
+    else
+    {
+      pixels.setPixelColor(0, 0);
+    }
+    pixels.show();
+  }
+}
