@@ -22,7 +22,7 @@
 
 // ================= CONFIGURATION =================
 #define NUM_SLOTS 4
-#define LED_PIN 6                // External SK6812 GRBW LED (GPIO 6)
+#define LED_PIN 6 // External SK6812 GRBW LED (GPIO 6)
 #define LED_BRIGHTNESS 48
 
 // POWER SAVING
@@ -30,13 +30,13 @@
 #define IDLE_TIME_SLEEP_MS 1800000
 
 // Button controls
-#define BOOT_BUTTON_PIN 5        // External BOOT micro switch (GPIO 5)
+#define BOOT_BUTTON_PIN 5 // External BOOT micro switch (GPIO 5)
 #define BOOT_SHORT_PRESS_MS 60
 #define BOOT_LONG_PRESS_MS 1500
 
 // Battery ADC
-#define BATTERY_ADC_PIN 3        // Voltaj bolucu: BAT+ -> 100k -> GPIO3 -> 100k -> GND
-#define BATTERY_UPDATE_MS 30000  // Her 30 saniyede bir pil seviyesi guncelle
+#define BATTERY_ADC_PIN 3       // Voltaj bolucu: BAT+ -> 100k -> GPIO3 -> 100k -> GND
+#define BATTERY_UPDATE_MS 30000 // Her 30 saniyede bir pil seviyesi guncelle
 
 // Key Codes
 #define KEY_MOD_LSHIFT 0x02
@@ -53,7 +53,8 @@ Adafruit_NeoPixel pixels(1, LED_PIN, NEO_GRBW + NEO_KHZ800);
 static uint8_t wasdKeysLightState = 0;
 static uint8_t otherKeysLightState = 0;
 
-enum ConnectionState {
+enum ConnectionState
+{
   STATE_DISCONNECTED_RECONNECTING,
   STATE_DISCONNECTED_PAIRING,
   STATE_CONNECTED
@@ -82,7 +83,8 @@ NimBLECharacteristic *pConsumerChar = nullptr;
 QueueHandle_t hidQueue = nullptr;
 volatile uint16_t activeConnHandle = INVALID_CONN_HANDLE;
 
-typedef struct {
+typedef struct
+{
   uint8_t *rawData;
   size_t len;
 } hid_event_t;
@@ -109,8 +111,7 @@ const uint8_t hidReportMap[] = {
     0x95, 0x01,
     0x75, 0x10,
     0x81, 0x00,
-    0xC0
-};
+    0xC0};
 
 // ================= FORWARD DECLARATIONS =================
 void startBLE(int slot);
@@ -128,42 +129,64 @@ uint8_t readBatteryLevel();
 void updateBatteryLevel();
 
 // ================= BATTERY =================
-uint8_t readBatteryLevel() {
+uint8_t readBatteryLevel()
+{
   // Voltaj okuyucu icin gerekli baglanti semasi: TP4056 uzerinde: BAT+ -> 100k direnc -> GPIO3 -> 100k direnc -> GND
   // ADC: 12-bit (0-4095), referans 3.3V
   // GPIO3 voltaji = V_bat * 0.5
   // Pil: 3.7V (bos) - 4.25V (dolu)
 
-  // 10 okuma al, ortalamasini hesapla
-  int sum = 0;
-  for (int i = 0; i < 10; i++) {
-    sum += analogRead(BATTERY_ADC_PIN);
-    delay(5);
+  // Pilinin üzerindeki etiket değerlerine göre tam uyumlu sınırlar
+  const float V_MAX = 4.25f; // Maksimum şarj voltajın
+  const float V_MIN = 3.45f; // Güvenli deşarj tabanın
+
+  uint32_t mv_sum = 0;
+
+  analogReadMilliVolts(BATTERY_ADC_PIN);
+  delay(10);
+
+  for (int i = 0; i < 10; i++)
+  {
+    mv_sum += analogReadMilliVolts(BATTERY_ADC_PIN);
+    delay(20);
   }
-  int raw = sum / 10;
 
-  float adcVolt = (raw / 4095.0f) * 3.3f;
-  float batVolt = adcVolt * 2.0f;
+  float adcVolt = (mv_sum / 10.0f) / 1000.0f;
 
-  float percent = (batVolt - 3.7f) / (4.25f - 3.7f) * 100.0f;
-  if (percent > 100.0f) percent = 100.0f;
-  if (percent < 0.0f) percent = 0.0f;
+  // Kalibrasyon çarpanı (Önceki adımda bahsettiğim multimetre testine göre
+  // bu 2.14f değerini ince ayarlayabilirsin)
+  float batVolt = adcVolt * 2.045f;
+
+  Serial.printf("--> Okunan ADC: %.3fV | Hesaplanan Pil: %.3fV\n", adcVolt, batVolt);
+
+  // Yeni limitlere göre yüzde hesabı
+  float percent = ((batVolt - V_MIN) / (V_MAX - V_MIN)) * 100.0f;
+
+  if (percent > 100.0f)
+    percent = 100.0f;
+  if (percent < 0.0f)
+    percent = 0.0f;
 
   return (uint8_t)percent;
 }
 
-void updateBatteryLevel() {
-  if (!isConnected || pHidDev == nullptr) return;
+void updateBatteryLevel()
+{
+  if (!isConnected || pHidDev == nullptr)
+    return;
   uint8_t level = readBatteryLevel();
   pHidDev->setBatteryLevel(level);
 }
 
 // ================= CALLBACKS =================
-class MySecurityCallbacks : public NimBLESecurityCallbacks {
+class MySecurityCallbacks : public NimBLESecurityCallbacks
+{
   bool onConfirmPIN(uint32_t pin) override { return true; }
   bool onSecurityRequest() override { return true; }
-  void onAuthenticationComplete(ble_gap_conn_desc *desc) override {
-    if (!desc->sec_state.encrypted) {
+  void onAuthenticationComplete(ble_gap_conn_desc *desc) override
+  {
+    if (!desc->sec_state.encrypted)
+    {
       pServer->disconnect(desc->conn_handle);
     }
   }
@@ -171,8 +194,10 @@ class MySecurityCallbacks : public NimBLESecurityCallbacks {
   void onPassKeyNotify(uint32_t pass_key) override {}
 };
 
-class MyServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) override {
+class MyServerCallbacks : public NimBLEServerCallbacks
+{
+  void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) override
+  {
     activeConnHandle = desc->conn_handle;
     isConnected = true;
     appState = STATE_CONNECTED;
@@ -182,10 +207,12 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
     updateBatteryLevel();
   }
 
-  void onDisconnect(NimBLEServer *pServer) override {
+  void onDisconnect(NimBLEServer *pServer) override
+  {
     activeConnHandle = INVALID_CONN_HANDLE;
     isConnected = false;
-    if (isSwitching) return;
+    if (isSwitching)
+      return;
     if (appState == STATE_CONNECTED)
       appState = STATE_DISCONNECTED_RECONNECTING;
     pServer->getAdvertising()->start();
@@ -196,40 +223,54 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
 // ================= USB CALLBACKS =================
 void hid_host_interface_callback(hid_host_device_handle_t hid_device_handle,
                                  const hid_host_interface_event_t event,
-                                 void *arg) {
-  if (event == HID_HOST_INTERFACE_EVENT_INPUT_REPORT) {
+                                 void *arg)
+{
+  if (event == HID_HOST_INTERFACE_EVENT_INPUT_REPORT)
+  {
     const size_t buffer_size = 64;
     uint8_t *data_buffer = (uint8_t *)malloc(buffer_size);
     size_t data_len = 0;
 
-    if (data_buffer) {
+    if (data_buffer)
+    {
       esp_err_t err = hid_host_device_get_raw_input_report_data(
           hid_device_handle, data_buffer, buffer_size, &data_len);
 
-      if (err == ESP_OK && data_len > 0) {
+      if (err == ESP_OK && data_len > 0)
+      {
         hid_event_t evt;
         evt.len = data_len;
         evt.rawData = data_buffer;
 
-        if (hidQueue != NULL) {
-          if (xQueueSend(hidQueue, &evt, 0) != pdTRUE) {
+        if (hidQueue != NULL)
+        {
+          if (xQueueSend(hidQueue, &evt, 0) != pdTRUE)
+          {
             free(data_buffer);
           }
-        } else {
+        }
+        else
+        {
           free(data_buffer);
         }
-      } else {
+      }
+      else
+      {
         free(data_buffer);
       }
     }
-  } else if (event == HID_HOST_INTERFACE_EVENT_DISCONNECTED) {
+  }
+  else if (event == HID_HOST_INTERFACE_EVENT_DISCONNECTED)
+  {
     hid_host_device_close(hid_device_handle);
   }
 }
 
 void hid_host_driver_callback(hid_host_device_handle_t hid_device_handle,
-                              const hid_host_driver_event_t event, void *arg) {
-  if (event == HID_HOST_DRIVER_EVENT_CONNECTED) {
+                              const hid_host_driver_event_t event, void *arg)
+{
+  if (event == HID_HOST_DRIVER_EVENT_CONNECTED)
+  {
     const hid_host_device_config_t dev_config = {
         .callback = hid_host_interface_callback, .callback_arg = NULL};
     hid_host_device_open(hid_device_handle, &dev_config);
@@ -239,19 +280,22 @@ void hid_host_driver_callback(hid_host_device_handle_t hid_device_handle,
 
 // ================= LOGIC =================
 
-void buildSlotBleAddress(int slot, uint8_t out[6]) {
+void buildSlotBleAddress(int slot, uint8_t out[6])
+{
   memcpy(out, baseMac, sizeof(baseMac));
   out[0] = (out[0] & 0xF0) | ((slot + 1) * 3);
   out[5] = (out[5] & 0x3F) | 0xC0;
 }
 
-bool configureSlotBleIdentity(int slot) {
+bool configureSlotBleIdentity(int slot)
+{
   uint8_t slotAddress[6];
   buildSlotBleAddress(slot, slotAddress);
   NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
 
   int rc = ble_hs_id_set_rnd(slotAddress);
-  if (rc != 0) {
+  if (rc != 0)
+  {
     Serial.printf("Failed to set BLE address for slot %d, rc=%d\n", slot + 1, rc);
     NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_PUBLIC);
     return false;
@@ -259,24 +303,32 @@ bool configureSlotBleIdentity(int slot) {
   return true;
 }
 
-void updateLED() {
-  if (appState == STATE_CONNECTED) {
-    if (isEcoMode) {
+void updateLED()
+{
+  if (appState == STATE_CONNECTED)
+  {
+    if (isEcoMode)
+    {
       pixels.setPixelColor(0, pixels.Color(129, 200, 190, 20));
-    } else {
+    }
+    else
+    {
       uint32_t hex = slotColors[currentSlot];
       uint8_t r = (hex >> 16) & 0xFF;
       uint8_t g = (hex >> 8) & 0xFF;
       uint8_t b_val = hex & 0xFF;
       pixels.setPixelColor(0, pixels.Color(r, g, b_val, 0));
     }
-  } else {
+  }
+  else
+  {
     pixels.setPixelColor(0, 0);
   }
   pixels.show();
 }
 
-void startBLE(int slot) {
+void startBLE(int slot)
+{
   isSwitching = false;
   currentSlot = slot;
   storedSlot = slot;
@@ -329,19 +381,24 @@ void startBLE(int slot) {
   lastKeyTime = millis();
 }
 
-void stopBLE() {
+void stopBLE()
+{
   isSwitching = true;
-  if (pServer) {
+  if (pServer)
+  {
     std::vector<uint16_t> peers = pServer->getPeerDevices();
-    for (uint16_t connHandle : peers) {
+    for (uint16_t connHandle : peers)
+    {
       pServer->disconnect(connHandle);
     }
 
-    if (activeConnHandle != INVALID_CONN_HANDLE && peers.empty()) {
+    if (activeConnHandle != INVALID_CONN_HANDLE && peers.empty())
+    {
       pServer->disconnect(activeConnHandle);
     }
 
-    if (pServer->getConnectedCount() > 0) {
+    if (pServer->getConnectedCount() > 0)
+    {
       unsigned long start = millis();
       while (pServer->getConnectedCount() > 0 && millis() - start < 1000)
         delay(10);
@@ -358,7 +415,8 @@ void stopBLE() {
   }
 }
 
-void handleSlotSwitch(int newSlot, bool pairingMode) {
+void handleSlotSwitch(int newSlot, bool pairingMode)
+{
   if (newSlot == currentSlot &&
       pairingMode == (appState == STATE_DISCONNECTED_PAIRING))
     return;
@@ -370,9 +428,11 @@ void handleSlotSwitch(int newSlot, bool pairingMode) {
   startBLE(currentSlot);
 }
 
-void handleFactoryReset() {
+void handleFactoryReset()
+{
   stopBLE();
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 5; i++)
+  {
     pixels.setPixelColor(0, pixels.Color(255, 0, 0, 0));
     pixels.show();
     delay(100);
@@ -385,7 +445,8 @@ void handleFactoryReset() {
   ESP.restart();
 }
 
-void clearBondsAndEnterPairing() {
+void clearBondsAndEnterPairing()
+{
   stopBLE();
   NimBLEDevice::init("");
   NimBLEDevice::deleteAllBonds();
@@ -395,7 +456,8 @@ void clearBondsAndEnterPairing() {
   startBLE(currentSlot);
 }
 
-void enterDeepSleep() {
+void enterDeepSleep()
+{
   stopBLE();
   pixels.clear();
   pixels.show();
@@ -403,24 +465,28 @@ void enterDeepSleep() {
   esp_deep_sleep_start();
 }
 
-bool ignoreWasdKeysLights(hid_event_t *evt) {
+bool ignoreWasdKeysLights(hid_event_t *evt)
+{
   // HID for WASD lights:
   // HID len=4: 03 00 00 01
   // HID len=8: 04 00 02 04 00 00 00 00
   // HID len=4: 03 00 00 00
 
-  if (evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x01) {
+  if (evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x01)
+  {
     otherKeysLightState = 0;
     wasdKeysLightState = 1;
     free(evt->rawData);
     return true;
   }
-  if (wasdKeysLightState == 1 && evt->len == 8 && evt->rawData[0] == 0x04) {
+  if (wasdKeysLightState == 1 && evt->len == 8 && evt->rawData[0] == 0x04)
+  {
     wasdKeysLightState = 2;
     free(evt->rawData);
     return true;
   }
-  if (wasdKeysLightState == 2 && evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x00) {
+  if (wasdKeysLightState == 2 && evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x00)
+  {
     wasdKeysLightState = 0;
     free(evt->rawData);
     return true;
@@ -428,24 +494,28 @@ bool ignoreWasdKeysLights(hid_event_t *evt) {
   return false;
 }
 
-bool ignoreOtherKeysLights(hid_event_t *evt) {
+bool ignoreOtherKeysLights(hid_event_t *evt)
+{
   // HID for REST of keyboard lights:
   // HID len=4: 03 00 00 02
   // HID len=8: 04 00 01 04 00 00 00 00
   // HID len=4: 03 00 00 00
 
-  if (evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x02) {
+  if (evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x02)
+  {
     wasdKeysLightState = 0;
     otherKeysLightState = 1;
     free(evt->rawData);
     return true;
   }
-  if (otherKeysLightState == 1 && evt->len == 8 && evt->rawData[0] == 0x04) {
+  if (otherKeysLightState == 1 && evt->len == 8 && evt->rawData[0] == 0x04)
+  {
     otherKeysLightState = 2;
     free(evt->rawData);
     return true;
   }
-  if (otherKeysLightState == 2 && evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x00) {
+  if (otherKeysLightState == 2 && evt->len == 4 && evt->rawData[0] == 0x03 && evt->rawData[3] == 0x00)
+  {
     otherKeysLightState = 0;
     free(evt->rawData);
     return true;
@@ -453,7 +523,8 @@ bool ignoreOtherKeysLights(hid_event_t *evt) {
   return false;
 }
 
-void processHID(hid_event_t *evt) {
+void processHID(hid_event_t *evt)
+{
 
   // DEBUG - HID kodlarini serial.monitor'e yazdir
   // Serial.printf("HID len=%d: ", evt->len);
@@ -463,33 +534,46 @@ void processHID(hid_event_t *evt) {
   // Serial.println();
 
   lastKeyTime = millis();
-  if (isEcoMode && isConnected) {
+  if (isEcoMode && isConnected)
+  {
     isEcoMode = false;
     updateLED();
   }
 
   // Klavye aydinlatma tuslarini yoksay
-  if (ignoreWasdKeysLights(evt)) return;
-  if (ignoreOtherKeysLights(evt)) return;
+  if (ignoreWasdKeysLights(evt))
+    return;
+  if (ignoreOtherKeysLights(evt))
+    return;
 
   // --- STANDARD KEYBOARD (len=8) ---
-  if (evt->len == 8) {
+  if (evt->len == 8)
+  {
     uint8_t mod = evt->rawData[0];
     bool isShift = (mod & KEY_MOD_LSHIFT) || (mod & KEY_MOD_RSHIFT);
     bool isInsert = false;
     int numKey = -1;
 
-    for (int i = 2; i < 8; i++) {
-      if (evt->rawData[i] == KEY_INSERT) isInsert = true;
-      if (evt->rawData[i] == KEY_1) numKey = 0;
-      if (evt->rawData[i] == KEY_2) numKey = 1;
-      if (evt->rawData[i] == KEY_3) numKey = 2;
-      if (evt->rawData[i] == KEY_4) numKey = 3;
-      if (evt->rawData[i] == KEY_0) numKey = 99;
+    for (int i = 2; i < 8; i++)
+    {
+      if (evt->rawData[i] == KEY_INSERT)
+        isInsert = true;
+      if (evt->rawData[i] == KEY_1)
+        numKey = 0;
+      if (evt->rawData[i] == KEY_2)
+        numKey = 1;
+      if (evt->rawData[i] == KEY_3)
+        numKey = 2;
+      if (evt->rawData[i] == KEY_4)
+        numKey = 3;
+      if (evt->rawData[i] == KEY_0)
+        numKey = 99;
     }
 
-    if (isInsert && numKey != -1) {
-      if (isShift && numKey == 99) {
+    if (isInsert && numKey != -1)
+    {
+      if (isShift && numKey == 99)
+      {
         free(evt->rawData);
         handleFactoryReset();
         return;
@@ -502,27 +586,38 @@ void processHID(hid_event_t *evt) {
       return;
     }
 
-    if (appState == STATE_CONNECTED && pInputChar) {
+    if (appState == STATE_CONNECTED && pInputChar)
+    {
       pInputChar->setValue(evt->rawData, 8);
       pInputChar->notify();
     }
   }
 
   // --- MEDIA TUSLARI (len=2, rawData[0]==0x02) ---
-  else if (evt->len == 2 && evt->rawData[0] == 0x02) {
-    if (appState == STATE_CONNECTED && pConsumerChar) {
+  else if (evt->len == 2 && evt->rawData[0] == 0x02)
+  {
+    if (appState == STATE_CONNECTED && pConsumerChar)
+    {
       uint8_t g710val = evt->rawData[1];
       uint16_t hidUsage = 0;
 
-      if      (g710val == 0x01) hidUsage = 0x00B5; // Sonraki
-      else if (g710val == 0x02) hidUsage = 0x00B6; // Onceki
-      else if (g710val == 0x04) hidUsage = 0x00B7; // Stop
-      else if (g710val == 0x08) hidUsage = 0x00CD; // Play/Pause
-      else if (g710val == 0x10) hidUsage = 0x00E9; // Ses Artir
-      else if (g710val == 0x20) hidUsage = 0x00EA; // Ses Azalt
-      else if (g710val == 0x40) hidUsage = 0x00E2; // Sessiz
+      if (g710val == 0x01)
+        hidUsage = 0x00B5; // Sonraki
+      else if (g710val == 0x02)
+        hidUsage = 0x00B6; // Onceki
+      else if (g710val == 0x04)
+        hidUsage = 0x00B7; // Stop
+      else if (g710val == 0x08)
+        hidUsage = 0x00CD; // Play/Pause
+      else if (g710val == 0x10)
+        hidUsage = 0x00E9; // Ses Artir
+      else if (g710val == 0x20)
+        hidUsage = 0x00EA; // Ses Azalt
+      else if (g710val == 0x40)
+        hidUsage = 0x00E2; // Sessiz
 
-      if (hidUsage != 0) {
+      if (hidUsage != 0)
+      {
         uint8_t mediaReport[2];
         mediaReport[0] = hidUsage & 0xFF;
         mediaReport[1] = (hidUsage >> 8) & 0xFF;
@@ -538,27 +633,40 @@ void processHID(hid_event_t *evt) {
   }
 
   // --- G TUSLARI (len=4, rawData[0]==0x03) ---
-  else if (evt->len == 4 && evt->rawData[0] == 0x03) {
-    if (appState == STATE_CONNECTED && pInputChar) {
+  else if (evt->len == 4 && evt->rawData[0] == 0x03)
+  {
+    if (appState == STATE_CONNECTED && pInputChar)
+    {
       uint8_t gReport[8] = {0};
       uint8_t gByte = evt->rawData[1];
       uint8_t mByte = evt->rawData[2];
 
       // G1-G6 → F13-F18
-      if      (gByte == 0x01) gReport[2] = 0x68;
-      else if (gByte == 0x02) gReport[2] = 0x69;
-      else if (gByte == 0x04) gReport[2] = 0x6A;
-      else if (gByte == 0x08) gReport[2] = 0x6B;
-      else if (gByte == 0x10) gReport[2] = 0x6C;
-      else if (gByte == 0x20) gReport[2] = 0x6D;
+      if (gByte == 0x01)
+        gReport[2] = 0x68;
+      else if (gByte == 0x02)
+        gReport[2] = 0x69;
+      else if (gByte == 0x04)
+        gReport[2] = 0x6A;
+      else if (gByte == 0x08)
+        gReport[2] = 0x6B;
+      else if (gByte == 0x10)
+        gReport[2] = 0x6C;
+      else if (gByte == 0x20)
+        gReport[2] = 0x6D;
 
       // M1-M3, MR → F19-F22
-      if      (mByte == 0x10) gReport[2] = 0x6E;
-      else if (mByte == 0x20) gReport[2] = 0x6F;
-      else if (mByte == 0x40) gReport[2] = 0x70;
-      else if (mByte == 0x80) gReport[2] = 0x71;
+      if (mByte == 0x10)
+        gReport[2] = 0x6E;
+      else if (mByte == 0x20)
+        gReport[2] = 0x6F;
+      else if (mByte == 0x40)
+        gReport[2] = 0x70;
+      else if (mByte == 0x80)
+        gReport[2] = 0x71;
 
-      if (gReport[2] != 0) {
+      if (gReport[2] != 0)
+      {
         pInputChar->setValue(gReport, 8);
         pInputChar->notify();
         delay(10);
@@ -572,24 +680,28 @@ void processHID(hid_event_t *evt) {
   free(evt->rawData);
 }
 
-void checkPowerManagement() {
+void checkPowerManagement()
+{
   unsigned long now = millis();
   if (now - lastKeyTime > IDLE_TIME_SLEEP_MS)
     enterDeepSleep();
 
-  if (isConnected && !isEcoMode && (now - lastKeyTime > IDLE_TIME_ECO_MS)) {
+  if (isConnected && !isEcoMode && (now - lastKeyTime > IDLE_TIME_ECO_MS))
+  {
     isEcoMode = true;
     updateLED();
   }
 
   // Her 30 saniyede bir pil seviyesini guncelle
-  if (isConnected && (now - lastBatteryUpdate > BATTERY_UPDATE_MS)) {
+  if (isConnected && (now - lastBatteryUpdate > BATTERY_UPDATE_MS))
+  {
     lastBatteryUpdate = now;
     updateBatteryLevel();
   }
 }
 
-void handleBootButton() {
+void handleBootButton()
+{
   static bool prevPressed = false;
   static unsigned long pressedAt = 0;
   static bool initialized = false;
@@ -597,27 +709,34 @@ void handleBootButton() {
 
   bool pressed = (digitalRead(BOOT_BUTTON_PIN) == LOW);
 
-  if (!initialized) {
+  if (!initialized)
+  {
     initialized = true;
     readyAt = millis() + 1200;
     prevPressed = pressed;
     return;
   }
 
-  if (millis() < readyAt) {
+  if (millis() < readyAt)
+  {
     prevPressed = pressed;
     return;
   }
 
-  if (pressed && !prevPressed) {
+  if (pressed && !prevPressed)
+  {
     pressedAt = millis();
   }
 
-  if (!pressed && prevPressed) {
+  if (!pressed && prevPressed)
+  {
     unsigned long heldMs = millis() - pressedAt;
-    if (heldMs >= BOOT_LONG_PRESS_MS) {
+    if (heldMs >= BOOT_LONG_PRESS_MS)
+    {
       clearBondsAndEnterPairing();
-    } else if (heldMs >= BOOT_SHORT_PRESS_MS) {
+    }
+    else if (heldMs >= BOOT_SHORT_PRESS_MS)
+    {
       int nextSlot = (currentSlot + 1) % NUM_SLOTS;
       handleSlotSwitch(nextSlot, false);
     }
@@ -627,12 +746,14 @@ void handleBootButton() {
 }
 
 // ================= TASKS =================
-void usb_lib_task(void *arg) {
+void usb_lib_task(void *arg)
+{
   while (1)
     usb_host_lib_handle_events(portMAX_DELAY, NULL);
 }
 
-void hid_host_task(void *arg) {
+void hid_host_task(void *arg)
+{
   const usb_host_config_t host_config = {.skip_phy_setup = false,
                                          .intr_flags = ESP_INTR_FLAG_LEVEL1};
   usb_host_install(&host_config);
@@ -647,7 +768,8 @@ void hid_host_task(void *arg) {
   vTaskDelete(NULL);
 }
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   pixels.begin();
   pixels.setBrightness(LED_BRIGHTNESS);
@@ -657,7 +779,8 @@ void setup() {
   analogReadResolution(12);
   pinMode(BATTERY_ADC_PIN, INPUT);
 
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
+  {
     currentSlot = storedSlot;
   }
 
@@ -668,12 +791,14 @@ void setup() {
   startBLE(currentSlot);
 }
 
-void loop() {
+void loop()
+{
   hid_event_t evt;
   int drainCount = 0;
 
   while (hidQueue != NULL && xQueueReceive(hidQueue, &evt, 0) &&
-         drainCount < 10) {
+         drainCount < 10)
+  {
     processHID(&evt);
     drainCount++;
   }
@@ -684,10 +809,13 @@ void loop() {
   static unsigned long lastUpdate = 0;
   unsigned long now = millis();
 
-  if (appState == STATE_CONNECTED) {
+  if (appState == STATE_CONNECTED)
+  {
     if (now - lastUpdate > 1000)
       lastUpdate = now;
-  } else if (appState == STATE_DISCONNECTED_PAIRING) {
+  }
+  else if (appState == STATE_DISCONNECTED_PAIRING)
+  {
     int b = (now % 2000) > 1000 ? 2000 - (now % 2000) : (now % 2000);
     b = map(b, 0, 1000, 0, 255);
 
@@ -698,17 +826,22 @@ void loop() {
 
     pixels.setPixelColor(0, pixels.Color(r, g, b_val, 0));
     pixels.show();
-  } else if (appState == STATE_DISCONNECTED_RECONNECTING) {
+  }
+  else if (appState == STATE_DISCONNECTED_RECONNECTING)
+  {
     long cycle = now % 2000;
     bool on = (cycle < 100) || (cycle > 200 && cycle < 300) ||
               (cycle > 400 && cycle < 500);
-    if (on) {
+    if (on)
+    {
       uint32_t hex = slotColors[currentSlot];
       uint8_t r = (hex >> 16) & 0xFF;
       uint8_t g = (hex >> 8) & 0xFF;
       uint8_t b_val = hex & 0xFF;
       pixels.setPixelColor(0, pixels.Color(r, g, b_val, 0));
-    } else {
+    }
+    else
+    {
       pixels.setPixelColor(0, 0);
     }
     pixels.show();
