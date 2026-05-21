@@ -129,16 +129,23 @@ void updateBatteryLevel();
 
 // ================= BATTERY =================
 uint8_t readBatteryLevel() {
-  // Voltaj bolucu: BAT+ -> 100k -> GPIO3 -> 100k -> GND
+  // Voltaj okuyucu icin gerekli baglanti semasi: TP4056 uzerinde: BAT+ -> 100k direnc -> GPIO3 -> 100k direnc -> GND
   // ADC: 12-bit (0-4095), referans 3.3V
   // GPIO3 voltaji = V_bat * 0.5
-  // Pil: 3.7V (bos) - 4.2V (dolu)
+  // Pil: 3.7V (bos) - 4.25V (dolu)
 
-  int raw = analogRead(BATTERY_ADC_PIN);
+  // 10 okuma al, ortalamasini hesapla
+  int sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(BATTERY_ADC_PIN);
+    delay(5);
+  }
+  int raw = sum / 10;
+
   float adcVolt = (raw / 4095.0f) * 3.3f;
   float batVolt = adcVolt * 2.0f;
 
-  float percent = (batVolt - 3.7f) / (4.2f - 3.7f) * 100.0f;
+  float percent = (batVolt - 3.7f) / (4.25f - 3.7f) * 100.0f;
   if (percent > 100.0f) percent = 100.0f;
   if (percent < 0.0f) percent = 0.0f;
 
@@ -655,10 +662,6 @@ void setup() {
   }
 
   esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
-
-  // VBUS enable - USB Host icin
-  pinMode(12, OUTPUT);
-  digitalWrite(12, HIGH);
 
   hidQueue = xQueueCreate(20, sizeof(hid_event_t));
   xTaskCreate(hid_host_task, "hid_task", 4096, NULL, 2, NULL);
