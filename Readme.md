@@ -1,4 +1,4 @@
-# LOGITECH G710 USB Keyboard to BLE Bridge with ESP32-S3 (4-Slots)
+# LOGITECH G710 USB Keyboard to BLE Bridge with ESP32-S3 (4-Slots) v1.2
 
 This firmware transforms an **ESP32-S3** into a multi-slot Bluetooth LE bridge for wired USB keyboards. It is specifically optimized for the **Logitech G710**, providing custom G-key mappings, full media control support, and battery level reporting.
 
