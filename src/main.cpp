@@ -22,7 +22,7 @@
 
 // ================= CONFIGURATION =================
 #define NUM_SLOTS 4
-#define LED_PIN 6 // External SK6812 GRBW LED (GPIO 6)
+#define LED_PIN 6                // External SK6812 GRBW LED (GPIO 6)
 #define LED_BRIGHTNESS 48
 
 // POWER SAVING
@@ -30,13 +30,9 @@
 #define IDLE_TIME_SLEEP_MS 1800000
 
 // Button controls
-#define BOOT_BUTTON_PIN 5 // External BOOT micro switch (GPIO 5)
+#define BOOT_BUTTON_PIN 5        // External BOOT micro switch (GPIO 5)
 #define BOOT_SHORT_PRESS_MS 60
 #define BOOT_LONG_PRESS_MS 1500
-
-// Battery ADC
-#define BATTERY_ADC_PIN 3       // Voltaj bolucu: BAT+ -> 100k -> GPIO3 -> 100k -> GND
-#define BATTERY_UPDATE_MS 30000 // Her 30 saniyede bir pil seviyesi guncelle
 
 // Key Codes
 #define KEY_MOD_LSHIFT 0x02
@@ -68,7 +64,6 @@ volatile bool isSwitching = false;
 volatile bool isConnected = false;
 
 unsigned long lastKeyTime = 0;
-unsigned long lastBatteryUpdate = 0;
 bool isEcoMode = false;
 
 // Catppuccin Slot Renkleri
@@ -125,58 +120,6 @@ void handleBootButton();
 void clearBondsAndEnterPairing();
 void buildSlotBleAddress(int slot, uint8_t out[6]);
 bool configureSlotBleIdentity(int slot);
-uint8_t readBatteryLevel();
-void updateBatteryLevel();
-
-// ================= BATTERY =================
-uint8_t readBatteryLevel()
-{
-  // Voltaj okuyucu icin gerekli baglanti semasi: TP4056 uzerinde: BAT+ -> 100k direnc -> GPIO3 -> 100k direnc -> GND
-  // ADC: 12-bit (0-4095), referans 3.3V
-  // GPIO3 voltaji = V_bat * 0.5
-  // Pil: 3.7V (bos) - 4.25V (dolu)
-
-  // Pilinin üzerindeki etiket değerlerine göre tam uyumlu sınırlar
-  const float V_MAX = 4.25f; // Maksimum şarj voltajın
-  const float V_MIN = 3.45f; // Güvenli deşarj tabanın
-
-  uint32_t mv_sum = 0;
-
-  analogReadMilliVolts(BATTERY_ADC_PIN);
-  delay(10);
-
-  for (int i = 0; i < 10; i++)
-  {
-    mv_sum += analogReadMilliVolts(BATTERY_ADC_PIN);
-    delay(20);
-  }
-
-  float adcVolt = (mv_sum / 10.0f) / 1000.0f;
-
-  // Kalibrasyon çarpanı (Önceki adımda bahsettiğim multimetre testine göre
-  // bu 2.14f değerini ince ayarlayabilirsin)
-  float batVolt = adcVolt * 2.045f;
-
-  Serial.printf("--> Okunan ADC: %.3fV | Hesaplanan Pil: %.3fV\n", adcVolt, batVolt);
-
-  // Yeni limitlere göre yüzde hesabı
-  float percent = ((batVolt - V_MIN) / (V_MAX - V_MIN)) * 100.0f;
-
-  if (percent > 100.0f)
-    percent = 100.0f;
-  if (percent < 0.0f)
-    percent = 0.0f;
-
-  return (uint8_t)percent;
-}
-
-void updateBatteryLevel()
-{
-  if (!isConnected || pHidDev == nullptr)
-    return;
-  uint8_t level = readBatteryLevel();
-  pHidDev->setBatteryLevel(level);
-}
 
 // ================= CALLBACKS =================
 class MySecurityCallbacks : public NimBLESecurityCallbacks
@@ -204,7 +147,6 @@ class MyServerCallbacks : public NimBLEServerCallbacks
     updateLED();
     lastKeyTime = millis();
     isEcoMode = false;
-    updateBatteryLevel();
   }
 
   void onDisconnect(NimBLEServer *pServer) override
@@ -361,9 +303,6 @@ void startBLE(int slot)
   pHidDev->manufacturer()->setValue("ESP-Custom");
   pHidDev->pnp(0x02, 0xe502, 0xa111, 0x0211);
   pHidDev->hidInfo(0x00, 0x01);
-
-  // Pil servisi
-  pHidDev->setBatteryLevel(readBatteryLevel());
 
   NimBLEAdvertising *pAdvertising = pServer->getAdvertising();
   pAdvertising->setAppearance(HID_KEYBOARD);
@@ -525,7 +464,6 @@ bool ignoreOtherKeysLights(hid_event_t *evt)
 
 void processHID(hid_event_t *evt)
 {
-
   // DEBUG - HID kodlarini serial.monitor'e yazdir
   // Serial.printf("HID len=%d: ", evt->len);
   // for (size_t i = 0; i < evt->len; i++) {
@@ -691,13 +629,6 @@ void checkPowerManagement()
     isEcoMode = true;
     updateLED();
   }
-
-  // Her 30 saniyede bir pil seviyesini guncelle
-  if (isConnected && (now - lastBatteryUpdate > BATTERY_UPDATE_MS))
-  {
-    lastBatteryUpdate = now;
-    updateBatteryLevel();
-  }
 }
 
 void handleBootButton()
@@ -774,10 +705,6 @@ void setup()
   pixels.begin();
   pixels.setBrightness(LED_BRIGHTNESS);
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-
-  // ADC pini ayarla (pil voltaj olcumu)
-  analogReadResolution(12);
-  pinMode(BATTERY_ADC_PIN, INPUT);
 
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
   {
